@@ -1,0 +1,30 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.env
+.venv
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+.pytest_cache/
+
+# Local .env files
+.env.development
+.env.production
+
+# VS Code
+.vscode/
+
+# Database files
+tests/test.db
+
+# Airflow
+logs/
+airflow/logs

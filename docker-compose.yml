@@ -1,0 +1,299 @@
+x-airflow-common:
+  &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.10.4}
+  build:
+    context: ./app/airflow
+  env_file: ${ENV_FILE}
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:${POSTGRES_PORT}/${POSTGRES_DB}
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:${POSTGRES_PORT}/${POSTGRES_DB}
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:${REDIS_PORT}/0
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-./app/airflow}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-./app/airflow}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-./app/airflow}/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-./app/airflow}/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROj_DIR:-./app/airflow}/app:/opt/airflow/app
+    - ${AIRFLOW_PROJ_DIR:-./app}:/opt/airflow/app
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    db:
+      condition: service_healthy
+
+services:
+  # Database service ---------------------------------------------------------------------------------------------------------------------------------
+  db:
+    image: postgres:latest
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_INITDB_ARGS: "--auth-local=trust --auth-host=trust"
+    ports:
+      - "${POSTGRES_PORT}:${POSTGRES_PORT}"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh
+      - ./sql/setup.sql:/docker-entrypoint-initdb.d/setup.sql
+    env_file:
+      - ${ENV_FILE}
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+
+  # API service ---------------------------------------------------------------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+    ports:
+      - "${API_PORT}:${API_PORT}"
+    depends_on:
+      - db
+      - redis
+    env_file:
+      - ${ENV_FILE}
+    environment:
+      - PYTHONPATH=/app
+    networks:
+      - app-network
+    entrypoint: ["./scripts/wait-for-it.sh", "db:${POSTGRES_PORT}", "--timeout=60", "--", "sh", "-c", "python /app/scripts/create_admin_user.py && exec gunicorn -w 4 -k uvicorn.workers.UvicornWorker app.main:app --bind 0.0.0.0:${API_PORT}"]
+    volumes:
+      - ./scripts/create_admin_user.py:/app/scripts/create_admin_user.py
+    restart: unless-stopped
+
+  # Redis service ---------------------------------------------------------------------------------------------------------------------------------
+  redis:
+    image: redis:6
+    environment:
+      REDIS_PORT: ${REDIS_PORT}
+    ports:
+      - "${REDIS_PORT}:${REDIS_PORT}"
+    env_file:
+      - ${ENV_FILE}
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+
+  # # Airflow services ---------------------------------------------------------------------------------------------------------------------------------
+  # airflow-webserver:
+  #   <<: *airflow-common
+  #   command: webserver
+  #   environment:
+  #     <<: *airflow-common-env
+  #     PYTHONPATH: /opt/airflow/dags:/opt/airflow
+  #   ports:
+  #     - "${AIRFLOW_PORT}:${AIRFLOW_PORT}"
+  #   healthcheck:
+  #     test: ["CMD", "curl", "--fail", "http://localhost:${AIRFLOW_PORT}/health"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 5
+  #     start_period: 30s
+  #   restart: always
+  #   depends_on:
+  #     <<: *airflow-common-depends-on
+  #     airflow-init:
+  #       condition: service_completed_successfully
+  #   networks:
+  #     - app-network
+
+  # airflow-scheduler:
+  #   <<: *airflow-common
+  #   command: scheduler
+  #   environment:
+  #     <<: *airflow-common-env
+  #     PYTHONPATH: /opt/airflow/dags:/opt/airflow
+  #   healthcheck:
+  #     test: ["CMD", "curl", "--fail", "http://localhost:8793/health"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 5
+  #     start_period: 30s
+  #   restart: always
+  #   depends_on:
+  #     <<: *airflow-common-depends-on
+  #     airflow-init:
+  #       condition: service_completed_successfully
+  #   networks:
+  #     - app-network
+
+  # airflow-worker:
+  #   <<: *airflow-common
+  #   command: celery worker
+  #   environment:
+  #     <<: *airflow-common-env
+  #     PYTHONPATH: /opt/airflow/dags:/opt/airflow
+  #     DUMB_INIT_SETSID: "0"
+  #   healthcheck:
+  #     test:
+  #       - "CMD-SHELL"
+  #       - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 5
+  #     start_period: 30s
+  #   restart: always
+  #   depends_on:
+  #     <<: *airflow-common-depends-on
+  #     airflow-init:
+  #       condition: service_completed_successfully
+  #   networks:
+  #     - app-network
+
+  # airflow-triggerer:
+  #   <<: *airflow-common
+  #   command: triggerer
+  #   environment:
+  #     <<: *airflow-common-env
+  #     PYTHONPATH: /opt/airflow/dags:/opt/airflow
+  #   healthcheck:
+  #     test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 5
+  #     start_period: 30s
+  #   restart: always
+  #   depends_on:
+  #     <<: *airflow-common-depends-on
+  #     airflow-init:
+  #       condition: service_completed_successfully
+  #   networks:
+  #     - app-network
+
+  # airflow-init:
+  #   <<: *airflow-common
+  #   environment:
+  #     <<: *airflow-common-env
+  #     PYTHONPATH: /opt/airflow/dags:/opt/airflow
+  #     _AIRFLOW_DB_MIGRATE: 'true'
+  #     _AIRFLOW_WWW_USER_CREATE: 'true'
+  #     _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+  #     _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+  #     _PIP_ADDITIONAL_REQUIREMENTS: ''
+  #   entrypoint: /bin/bash
+  #   command:
+  #     - -c
+  #     - |
+  #       if [[ -z "${AIRFLOW_UID}" ]]; then
+  #         echo
+  #         echo -e "\033[1;33mWARNING!!!: AIRFLOW_UID not set!\e[0m"
+  #         echo "If you are on Linux, you SHOULD follow the instructions below to set "
+  #         echo "AIRFLOW_UID environment variable, otherwise files will be owned by root."
+  #         echo "For other operating systems you can get rid of the warning with manually created .env file:"
+  #         echo "    See: https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html#setting-the-right-airflow-user"
+  #         echo
+  #       fi
+  #       one_meg=1048576
+  #       mem_available=$$(($$(getconf _PHYS_PAGES) * $$(getconf PAGE_SIZE) / one_meg))
+  #       cpus_available=$$(grep -cE 'cpu[0-9]+' /proc/stat)
+  #       disk_available=$$(df / | tail -1 | awk '{print $$4}')
+  #       warning_resources="false"
+  #       if (( mem_available < 4000 )) ; then
+  #         echo
+  #         echo -e "\033[1;33mWARNING!!!: Not enough memory available for Docker.\e[0m"
+  #         echo "At least 4GB of memory required. You have $$(numfmt --to iec $$((mem_available * one_meg)))"
+  #         echo
+  #         warning_resources="true"
+  #       fi
+  #       if (( cpus_available < 2 )); then
+  #         echo
+  #         echo -e "\033[1;33mWARNING!!!: Not enough CPUS available for Docker.\e[0m"
+  #         echo "At least 2 CPUs recommended. You have $${cpus_available}"
+  #         echo
+  #         warning_resources="true"
+  #       fi
+  #       if (( disk_available < one_meg * 10 )); then
+  #         echo
+  #         echo -e "\033[1;33mWARNING!!!: Not enough Disk space available for Docker.\e[0m"
+  #         echo "At least 10 GBs recommended. You have $$(numfmt --to iec $$((disk_available * 1024 )))"
+  #         echo
+  #         warning_resources="true"
+  #       fi
+  #       if [[ $${warning_resources} == "true" ]]; then
+  #         echo
+  #         echo -e "\033[1;33mWARNING!!!: You have not enough resources to run Airflow (see above)!\e[0m"
+  #         echo "Please follow the instructions to increase amount of resources available:"
+  #         echo "   https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html#before-you-begin"
+  #         echo
+  #       fi
+  #       mkdir -p /sources/logs /sources/dags /sources/plugins
+  #       chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins}
+  #       exec /entrypoint airflow version
+  #   user: "0:0"
+  #   volumes:
+  #     - ${AIRFLOW_PROJ_DIR:-.}:/sources
+  #   networks:
+  #     - app-network
+
+  # airflow-cli:
+  #   <<: *airflow-common
+  #   profiles:
+  #     - debug
+  #   environment:
+  #     <<: *airflow-common-env
+  #     PYTHONPATH: /opt/airflow/dags:/opt/airflow
+  #     CONNECTION_CHECK_MAX_COUNT: "0"
+  #   command:
+  #     - bash
+  #     - -c
+  #     - airflow
+  #   networks:
+  #     - app-network
+
+  # Streamlit service ---------------------------------------------------------------------------------------------------------------------------------
+  streamlit:
+    build:
+      context: ./app/streamlit
+    ports:
+      - "${STREAMLIT_PORT}:${STREAMLIT_PORT}"
+    volumes:
+      - ./app/streamlit:/app
+    environment:
+      - STREAMLIT_SERVER_PORT=${STREAMLIT_PORT}
+    networks:
+      - app-network
+
+  # Nginx service ---------------------------------------------------------------------------------------------------------------------------------
+  nginx:
+    image: nginx:latest
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d
+    depends_on:
+      - api
+      # - airflow-webserver
+      - streamlit
+    links:
+      - api
+      - streamlit
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  pgdata:
+

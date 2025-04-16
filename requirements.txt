@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+pydantic
+sqlalchemy
+psycopg2-binary
+redis
+alembic
+pytest
+pydantic-settings
+httpx
+passlib[bcrypt]
+python-jose
+python-multipart
+PyJWT
+bcrypt==3.2.0
+scikit-learn
+tensorflow
